@@ -53,6 +53,32 @@ integrated_club = False
 integrated_club_type = ""
 facility_id = 0
 
+# Stable Home Assistant entity mapping -------------------------------------------------------------
+# MQTT/backend IDs can change per club (66, 70, 72...) but Home Assistant should expose
+# stable entities for automations and dashboards: binary_sensor.pista_1, binary_sensor.pista_2...
+# and binary_sensor.puerta_1, binary_sensor.puerta_2...
+LIGHT_ENTITY_MAP = {}          # backend/MQTT light id -> HA entity suffix (pista_N)
+LIGHT_ENTITY_REVERSE_MAP = {}  # HA entity suffix (pista_N) -> backend light id
+DOOR_ENTITY_MAP = {}           # backend/MQTT door id -> HA entity suffix (puerta_N)
+DOOR_ENTITY_REVERSE_MAP = {}   # HA entity suffix (puerta_N) -> backend door id
+
+def _entity_suffix(entity_id):
+    return str(entity_id).replace('binary_sensor.', '')
+
+def get_stable_light_entity_id(light_id):
+    return LIGHT_ENTITY_MAP.get(str(light_id), str(light_id))
+
+def get_original_light_id(entity_id):
+    suffix = _entity_suffix(entity_id)
+    return LIGHT_ENTITY_REVERSE_MAP.get(suffix, suffix)
+
+def get_stable_door_entity_id(door_id):
+    return DOOR_ENTITY_MAP.get(str(door_id), 'door{}'.format(door_id))
+
+def get_original_door_id(entity_id):
+    suffix = _entity_suffix(entity_id)
+    return DOOR_ENTITY_REVERSE_MAP.get(suffix, suffix.replace('door', ''))
+
 
 #Ignore sun light status-----------------------------------------------------------------------------------------------------------------------
 def checkIgnoreSunLight():
@@ -457,10 +483,23 @@ def fetch_court_ids():
         court_ids = [d[1] for d in lights]
         c_ids = [d[0] for d in lights]
 
+        # Build stable mapping for HA entities while keeping MQTT/backend IDs unchanged.
+        # Examples: backend/MQTT 66 -> binary_sensor.pista_1, 67 -> binary_sensor.pista_2
+        global LIGHT_ENTITY_MAP, LIGHT_ENTITY_REVERSE_MAP
+        LIGHT_ENTITY_MAP = {}
+        LIGHT_ENTITY_REVERSE_MAP = {}
+        for index, light in enumerate(lights, start=1):
+            stable_entity_id = f"pista_{index}"
+            # light[1] is the ID normally used in MQTT/state topics; light[0] is the backend DB id.
+            LIGHT_ENTITY_MAP[str(light[1])] = stable_entity_id
+            LIGHT_ENTITY_MAP[str(light[0])] = stable_entity_id
+            # For writes back to OK Cloud, use the backend DB id.
+            LIGHT_ENTITY_REVERSE_MAP[stable_entity_id] = str(light[0])
+
         # create lights in HA
-        for light in lights:
+        for index, light in enumerate(lights, start=1):
             logging.info(f"LightID: {light[1]}, State: {light[4]}")
-            light_id = light[1]
+            light_id = get_stable_light_entity_id(light[1])
             friendly_name = light[3]
             state = light[4]
             min_level = light[5]
@@ -749,7 +788,7 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
         if brightness_pct is None:
             brightness_pct = 100 if state == "on" else 0
 
-        data_from_mqtt = court_id
+        data_from_mqtt = get_stable_light_entity_id(court_id)
         api_url_sensor = api_url.format(data_from_mqtt)
 
         respose_get_entity = requests.get(api_url_sensor, headers=headers)
@@ -758,7 +797,7 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
             logging.info(respose_get_entity.json())
 
             sensor_data = {
-                "entity_id": court_id,
+                "entity_id": data_from_mqtt,
                 "state": "off" if state == "off" else "on",
                 "attributes": {
                     "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
@@ -1060,10 +1099,21 @@ def fetch_door_ids():
         doors = db.getDoors(ok_cloud_access_token,back_end_url,club_id, facility_id)
         logging.info('GETTING DOOR IDs==========================')
         door_ids = [d[1] for d in doors]
+
+        # Build stable mapping for HA door entities while keeping MQTT/backend IDs unchanged.
+        # Examples: backend/MQTT 33 -> binary_sensor.puerta_1, 48 -> binary_sensor.puerta_2
+        global DOOR_ENTITY_MAP, DOOR_ENTITY_REVERSE_MAP
+        DOOR_ENTITY_MAP = {}
+        DOOR_ENTITY_REVERSE_MAP = {}
+        for index, door in enumerate(doors, start=1):
+            stable_entity_id = f"puerta_{index}"
+            DOOR_ENTITY_MAP[str(door[1])] = stable_entity_id
+            DOOR_ENTITY_MAP[str(door[0])] = stable_entity_id
+            DOOR_ENTITY_REVERSE_MAP[stable_entity_id] = str(door[1])
         
 
         # create doors in HA
-        for door in doors:
+        for index, door in enumerate(doors, start=1):
             logging.info('IN a Loop==========================')
             api_url = home_assistant_url+"/api/states/binary_sensor.{}"
             access_token = home_assistant_access_key
@@ -1072,8 +1122,9 @@ def fetch_door_ids():
                 "Content-Type": "application/json",
             }
 
+            stable_door_entity_id = get_stable_door_entity_id(door[1])
             sensor_data = {
-                "entity_id": "door{}".format(door[1]),
+                "entity_id": stable_door_entity_id,
                 "state": "off",
                 "attributes": {
                     "friendly_name": door[3],
@@ -1268,7 +1319,7 @@ def fetch_data_with_door_id(state,door_id):
             "Content-Type": "application/json",
         }
 
-        data_from_mqtt = "door{}".format(door_id)
+        data_from_mqtt = get_stable_door_entity_id(door_id)
         logging.info('entity id form mqtt:'+str(data_from_mqtt))
 
         api_url_sensor = api_url.format(data_from_mqtt)
@@ -1277,7 +1328,7 @@ def fetch_data_with_door_id(state,door_id):
         if respose_get_entity.status_code == 200:
             logging.info(respose_get_entity.json())
             sensor_data = {
-                "entity_id": "door{}".format(door_id),
+                "entity_id": data_from_mqtt,
                 "state": "off" if state == 'close' else "on",
                 "attributes": {
                     "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
@@ -1506,7 +1557,7 @@ def updateEntityState(club_id):
         logging.info(entity_id)
 
         if device_class == 'light':
-            id = entity_id.split('.')[1]
+            id = get_original_light_id(entity_id)
             logging.info(id)
 
             url = f"{back_end_url}api/lights/update-light-status?clubId={club_id}"
@@ -1534,7 +1585,7 @@ def updateEntityState(club_id):
                 return message
             
         if device_class == 'door':
-            id = entity_id[len('binary_sensor.door'):]
+            id = get_original_door_id(entity_id)
 
             if doorState == 'on':
                 status= True
