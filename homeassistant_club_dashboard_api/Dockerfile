@@ -20,7 +20,6 @@ WORKDIR /data
 COPY run.sh /
 # COPY requirements.txt /
 COPY homeassistant_club_dashboard_api /homeassistant_club_dashboard_api/
-COPY cert /cert/
 
 RUN pip3 install flask
 RUN pip3 install flask-cors

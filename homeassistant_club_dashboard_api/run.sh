@@ -51,6 +51,32 @@ cd /
 pip3 --version
 
 
+
+# Certificates are NOT bundled in the public repository.
+# They must be placed manually in the add-on persistent configuration folder:
+#   /addon_configs/homeassistant_club_dashboard_api/cert/   (from Home Assistant / Studio Code Server)
+# Inside the add-on container this folder is mounted as:
+#   /addon_config/cert/
+# The existing Python code expects /cert, so we create a runtime symlink.
+CERT_DIR="/addon_config/cert"
+LEGACY_CERT_DIR="/cert"
+
+mkdir -p "$CERT_DIR"
+rm -rf "$LEGACY_CERT_DIR"
+ln -s "$CERT_DIR" "$LEGACY_CERT_DIR"
+
+for required_file in \
+  "AmazonRootCA1.pem" \
+  "e85bd3ae03a42f7c060129714775af0c8a2e9d3aa57f42a3e3ece6738b4be4e9-certificate.pem.crt" \
+  "e85bd3ae03a42f7c060129714775af0c8a2e9d3aa57f42a3e3ece6738b4be4e9-private.pem.key"
+do
+  if [ ! -f "$CERT_DIR/$required_file" ]; then
+    echo "ERROR: Missing certificate file: $CERT_DIR/$required_file"
+    echo "Upload the required AWS IoT certificate files to /addon_configs/homeassistant_club_dashboard_api/cert/ and restart the add-on."
+    exit 1
+  fi
+done
+
 CONFIG_PATH=/data/options.json
 python3 -m homeassistant_club_dashboard_api ${UUID} ${ha_token} ${mqtt_broker} ${mqtt_port} "${club_name}" ${ok_cloud_access_token} ${back_end_url} ${club_id} ${facility_id} ${integrated_club} ${integrated_club_mode} 
 # ${mqtt_user_name} ${mqtt_user_password}
