@@ -1,6 +1,6 @@
 name: "Homeassistant Sports Club Dashboard API"
 description: "An intergration of Syltek and Home Assistant with a custom dashboard"
-version: "1.0.43"
+version: "1.0.44"
 slug: "homeassistant_club_dashboard_api"
 init: false
 arch:
@@ -45,5 +45,5 @@ schema:
   integrated_club_mode: list(none|syltek|taykus|playtomic)
 
 map:
-  - addon_config:rw
+  - ssl:rw
 webui: "http://[HOST]:[PORT:8000]"

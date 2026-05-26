@@ -53,12 +53,12 @@ pip3 --version
 
 
 # Certificates are NOT bundled in the public repository.
-# They must be placed manually in the add-on persistent configuration folder:
-#   /addon_configs/homeassistant_club_dashboard_api/cert/   (from Home Assistant / Studio Code Server)
-# Inside the add-on container this folder is mounted as:
-#   /addon_config/cert/
+# They must be placed manually in the stable Home Assistant SSL folder:
+#   /ssl/lobobrain/cert/   (from Home Assistant / Studio Code Server)
+# Inside the add-on container this folder is available as:
+#   /ssl/lobobrain/cert/
 # The existing Python code expects /cert, so we create a runtime symlink.
-CERT_DIR="/addon_config/cert"
+CERT_DIR="/ssl/lobobrain/cert"
 LEGACY_CERT_DIR="/cert"
 
 mkdir -p "$CERT_DIR"
@@ -72,7 +72,7 @@ for required_file in \
 do
   if [ ! -f "$CERT_DIR/$required_file" ]; then
     echo "ERROR: Missing certificate file: $CERT_DIR/$required_file"
-    echo "Upload the required AWS IoT certificate files to /addon_configs/homeassistant_club_dashboard_api/cert/ and restart the add-on."
+    echo "Upload the required AWS IoT certificate files to /ssl/lobobrain/cert/ and restart the add-on."
     exit 1
   fi
 done
