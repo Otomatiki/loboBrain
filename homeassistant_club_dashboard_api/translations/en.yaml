@@ -1,0 +1,28 @@
+configuration:
+  club_uuid:
+    name: Club UUID
+    discription: Enter your club UUID
+  club_name:
+    name: Club Name
+    discription: Enter your club name
+  home_assistant_access_token:
+    name: Home Assistant Access Token
+    discription: Enter your long-lived token
+  # mqtt_user_name:
+  #   name: MQTT Username
+  #   discription: Enter your MQTT user name
+  # mqtt_user_password:
+  #   name: MQTT User Password
+  #   discription: Enter MQTT user password
+  mqtt_broker:
+    name: MQTT Broker
+    discription: Enter MQTT broker
+  mqtt_port:
+    name: MQTT Port
+    discription: Enter MQTT port
+  integrated_club:
+    name: Integrated to Syltek or Tykus or Playtomic
+    discription: If the club is integrated to Syltek or Tykus or Playtomic systems
+  integrated_club_mode:
+    name: Integrated Type
+    discription: Type "syltek", if Integrated System is Syltek, or Type "playtomic", if Integrated System is Playtomic, or Type "taykus", if Integrated System is Taykus
