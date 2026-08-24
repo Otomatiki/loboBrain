@@ -149,9 +149,9 @@ def getLights(ok_cloud_access_token,back_end_url,club_uuid, club_id, facility_id
                         item['automatic_mode'],
                         item['name'],
                         item['status'],
-                        item['min_level'],
-                        item['max_level'],
-                        item['limited_option'],
+                        item.get('min_level', 0),
+                        item.get('max_level', 100),
+                        item.get('limited_option', False),
                     ])
                 else:
                     if integrated_club_type  == "playtomic":
@@ -161,9 +161,9 @@ def getLights(ok_cloud_access_token,back_end_url,club_uuid, club_id, facility_id
                             item['automatic_mode'],
                             item['name'],
                             item['status'],
-                            item['min_level'],
-                            item['max_level'],
-                            item['limited_option'],
+                            item.get('min_level', 0),
+                            item.get('max_level', 100),
+                            item.get('limited_option', False),
                         ])
                     else:
                         lights_data.append([
@@ -172,9 +172,9 @@ def getLights(ok_cloud_access_token,back_end_url,club_uuid, club_id, facility_id
                             item['automatic_mode'],
                             item['name'],
                             item['status'],
-                            item['min_level'],
-                            item['max_level'],
-                            item['limited_option'],
+                            item.get('min_level', 0),
+                            item.get('max_level', 100),
+                            item.get('limited_option', False),
                     ])
 
             return lights_data
@@ -196,9 +196,9 @@ def getLights(ok_cloud_access_token,back_end_url,club_uuid, club_id, facility_id
                         item['automatic_mode'],
                         item['name'],
                         item['status'],
-                        item['min_level'],
-                        item['max_level'],
-                        item['limited_option'],
+                        item.get('min_level', 0),
+                        item.get('max_level', 100),
+                        item.get('limited_option', False),
                     ])
                 else:
                     lights_data.append([
@@ -207,9 +207,9 @@ def getLights(ok_cloud_access_token,back_end_url,club_uuid, club_id, facility_id
                         item['automatic_mode'],
                         item['name'],
                         item['status'],
-                        item['min_level'],
-                        item['max_level'],
-                        item['limited_option'],
+                        item.get('min_level', 0),
+                        item.get('max_level', 100),
+                        item.get('limited_option', False),
                     ])
 
             return lights_data
