@@ -772,9 +772,15 @@ def listen_mqtt_light_topics(court_ids):
                 parsed_payload = json.loads(payload)
                 logging.info(f"Parsed Payload2: {parsed_payload}")
 
-                logging.info(f"Court ID: {court_id}, New State: {parsed_payload['state']} , Brightness: {parsed_payload['brightness_pct']}")
-                # print("Court Id: ",court_id,"State: ", state)
-                fetch_data_with_light_id(parsed_payload['state'], court_id, parsed_payload['brightness_pct'])
+                # Handle both string payload ("on"/"off") and dict payload ({"state": "on", "brightness_pct": 100})
+                if isinstance(parsed_payload, str):
+                    state_value = parsed_payload
+                    brightness_value = 100 if parsed_payload == 'on' else 0
+                else:
+                    state_value = parsed_payload['state']
+                    brightness_value = parsed_payload['brightness_pct']
+                logging.info(f"Court ID: {court_id}, New State: {state_value} , Brightness: {brightness_value}")
+                fetch_data_with_light_id(state_value, court_id, brightness_value)
                 logging.info("State change Manually////////////////////////////////////////////")
 
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
