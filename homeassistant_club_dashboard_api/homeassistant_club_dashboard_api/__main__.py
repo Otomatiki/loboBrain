@@ -1026,20 +1026,26 @@ def ha_core_recovery_watcher():
     """
     Background worker: every HA_CORE_AVAILABILITY_CHECK_INTERVAL_SECONDS,
     checks whether Home Assistant Core is reachable via the Supervisor
-    proxy. On the transition unavailable -> available (i.e. Core just came
-    back after being down, most commonly a Core restart), replays every
-    light's last known desired state through pending_light_writes so
-    retry_pending_light_writes() recreates every binary_sensor.pista_N --
-    covers a plain restart during which no new light command happened to
-    arrive at all. Added 2026-09-11, second pass.
+    proxy, AND whether a known LoboBrain entity still exists there.
+    Replays every light's last known desired state through
+    pending_light_writes (so retry_pending_light_writes() recreates every
+    binary_sensor.pista_N) when either:
+      - the general API transitions unavailable -> available (Core was
+        down long enough for this watcher to observe it), or
+      - the API is reachable but a known entity is missing (404) -- this
+        catches a Core restart that completed entirely between two polls,
+        which a plain True -> True availability read would otherwise miss.
+    Added 2026-09-11 (second pass), sentinel check added in the fifth
+    pass after review found the True -> True blind spot.
     """
     global ha_core_available
     while True:
         time.sleep(HA_CORE_AVAILABILITY_CHECK_INTERVAL_SECONDS)
+        headers = {"Authorization": f"Bearer {home_assistant_access_key}"}
         try:
             response = requests.get(
                 home_assistant_url + "/api/",
-                headers={"Authorization": f"Bearer {home_assistant_access_key}"},
+                headers=headers,
                 timeout=HA_REQUEST_TIMEOUT,
             )
             available_now = response.status_code == 200
@@ -1049,18 +1055,54 @@ def ha_core_recovery_watcher():
         was_available = ha_core_available
         ha_core_available = available_now
 
-        # Only replay on an observed False -> True transition. Never on
-        # the very first check (was_available is None then) -- that's
+        # Sentinel check: even if the API itself is reachable, a Core
+        # restart that completed entirely between two polls would still
+        # have wiped LoboBrain's synthetic binary_sensor states. Pick any
+        # one known entity and confirm it still exists.
+        sentinel_missing = False
+        if available_now:
+            with last_light_states_lock:
+                known_entities = list(last_light_states.keys())
+            if known_entities:
+                try:
+                    sentinel_response = requests.get(
+                        f"{home_assistant_url}/api/states/binary_sensor.{known_entities[0]}",
+                        headers=headers,
+                        timeout=HA_REQUEST_TIMEOUT,
+                    )
+                    sentinel_missing = sentinel_response.status_code == 404
+                except Exception:
+                    # Inconclusive -- don't force a replay on a transient
+                    # error here, the general availability check above
+                    # already covers outright unreachability.
+                    sentinel_missing = False
+
+        # Replay on an observed False -> True transition, OR when the
+        # sentinel entity has vanished despite Core answering normally.
+        # Never on the very first check (was_available is None) -- that's
         # just establishing the baseline, not a recovery.
-        if was_available is False and available_now is True:
+        should_replay = (
+            (was_available is False and available_now is True)
+            or sentinel_missing
+        )
+
+        if should_replay:
             with last_light_states_lock:
                 snapshot = dict(last_light_states)
             logging.info(
-                f"Home Assistant Core is back -- replaying {len(snapshot)} "
-                f"known light state(s)."
+                f"Home Assistant Core recovery detected "
+                f"(availability transition={was_available is False and available_now is True}, "
+                f"sentinel_missing={sentinel_missing}) -- replaying "
+                f"{len(snapshot)} known light state(s)."
             )
+            # Fixed 2026-09-11 (fifth pass): was pending_light_writes.update(snapshot),
+            # which could overwrite a newer desired state that arrived via MQTT
+            # in the small window between taking the snapshot and applying it
+            # here. setdefault leaves any already-pending (i.e. more recent)
+            # entry untouched -- "last state always wins" still holds.
             with pending_light_writes_lock:
-                pending_light_writes.update(snapshot)
+                for entity_id, desired_state in snapshot.items():
+                    pending_light_writes.setdefault(entity_id, desired_state)
 
 #---------------------------------------------------------------------------------------------------------
 
