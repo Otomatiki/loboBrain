@@ -56,11 +56,10 @@ mqtt_user_password = ""
 mqtt_broker = ""
 mqtt_port = ""
 api_genaration_url = 'https://pro.syltek.com/hermes/api/v1/Lights/plcnext/register?'
-# Fixed 2026-09-11: was 'http://homeassistant.local:8123', an mDNS hostname
-# that can go stale after Home Assistant Core restarts (container gets a new
-# internal IP, this add-on's DNS resolution isn't refreshed until the add-on
-# itself restarts). The Supervisor proxy is the officially documented,
-# network-stable way for an add-on to reach Core -- no mDNS involved.
+# Fixed 2026-09-11: was 'http://homeassistant.local:8123', an mDNS
+# hostname. The Supervisor proxy is the officially documented,
+# network-stable way for an add-on to reach Core -- no mDNS involved,
+# no dependency on Avahi/nss-mdns resolution inside the container.
 home_assistant_url = 'http://supervisor/core'
 HA_REQUEST_TIMEOUT = (3, 5)  # (connect timeout, read timeout) seconds
 global_tenant = ''
@@ -395,7 +394,8 @@ async def handle_websocket(websocket, path):
             entity_id = message_dict['entity_id']
             token = message_dict['access_token']
             device_type = message_dict['device_type']
-            logging.info(token)
+            # Removed 2026-09-11: was logging.info(token) -- printed the
+            # dashboard/user's access token in plaintext.
 
             try:
                 isAuthorized = auth.validateAccessToken(f"Bearer {token}")
@@ -1692,7 +1692,8 @@ def fetch_data_with_door_id(state,door_id):
 #         return 501
 
 def updateEntityState(club_id):
-    logging.info(sys.argv[2])
+    # Removed 2026-09-11: was logging.info(sys.argv[2]) -- printed the
+    # long-lived HA access token in plaintext.
     try:
         
         body = request.get_json(force=True)
@@ -2611,9 +2612,6 @@ def signal_handler(signal, frame):
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
 
-    retry_thread = threading.Thread(target=retry_pending_light_writes, daemon=True)
-    retry_thread.start()
-
     logging.info(club_uuid)
     logging.info("home_assistant_access_key set: %s", bool(home_assistant_access_key))
     # logging.info(mqtt_user_name)
@@ -2688,6 +2686,15 @@ if __name__ == '__main__':
                                             t1.daemon = True
                                             t2 = threading.Thread(target=fetch_door_ids)
                                             t2.daemon = True
+
+                                            # Moved 2026-09-11: was started right at the top of
+                                            # __main__, before home_assistant_access_key /
+                                            # SUPERVISOR_TOKEN was even set. Not a functional bug in
+                                            # practice (pending_light_writes starts empty, so the
+                                            # worker has nothing to retry that early), but cleaner to
+                                            # start it only once config is actually loaded.
+                                            retry_thread = threading.Thread(target=retry_pending_light_writes, daemon=True)
+                                            retry_thread.start()
 
                                             t1.start()
                                             t2.start()
