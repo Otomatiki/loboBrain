@@ -47,6 +47,22 @@ pending_light_writes = {}
 pending_light_writes_lock = threading.Lock()
 PENDING_RETRY_INTERVAL_SECONDS = 7
 
+# Added 2026-09-11, second pass: pending_light_writes alone only covers
+# "a command arrived while HA was down". It does NOT cover a plain HA Core
+# restart during which no reservation/light event happens at all -- the
+# binary_sensor.* entities LoboBrain creates are synthetic REST-API states,
+# not entities backed by a real integration, so Core restarting makes them
+# disappear with nothing to bring them back. last_light_states keeps the
+# most recent known-good state of every light LoboBrain manages (updated on
+# every call, independent of whether the write succeeds), and
+# ha_core_recovery_watcher() detects the unavailable->available transition
+# and replays it all through the existing retry mechanism. Still just two
+# in-memory dicts and a periodic GET -- no persistence, no state machine.
+last_light_states = {}
+last_light_states_lock = threading.Lock()
+ha_core_available = None  # None = not checked yet, True/False afterwards
+HA_CORE_AVAILABILITY_CHECK_INTERVAL_SECONDS = 15
+
 #Variables-----------------------------------------------------------------------------------------------------------------------
 club_uuid = ""
 club_name = ""
@@ -79,6 +95,7 @@ facility_id = 0
 # and binary_sensor.puerta_1, binary_sensor.puerta_2...
 LIGHT_ENTITY_MAP = {}          # backend/MQTT light id -> HA entity suffix (pista_N)
 LIGHT_FRIENDLY_NAME_MAP = {}   # HA entity suffix (pista_N) -> friendly_name known from OK Cloud
+DOOR_FRIENDLY_NAME_MAP = {}    # HA entity suffix (puerta_N) -> friendly_name known from OK Cloud
 LIGHT_ENTITY_REVERSE_MAP = {}  # HA entity suffix (pista_N) -> backend light id
 DOOR_ENTITY_MAP = {}           # backend/MQTT door id -> HA entity suffix (puerta_N)
 DOOR_ENTITY_REVERSE_MAP = {}   # HA entity suffix (puerta_N) -> backend door id
@@ -448,7 +465,12 @@ async def handle_websocket(websocket, path):
                         while True:
                             msg_response = await websocket_ha.recv()
                             logging.info(f" {msg_response}")
-                            response_dict2 = json.loads(message)
+                            # Fixed 2026-09-11: was `json.loads(message)` --
+                            # parsed the original dashboard message over and
+                            # over instead of the response just received
+                            # from Home Assistant, so response2_type below
+                            # never actually reflected what HA sent back.
+                            response_dict2 = json.loads(msg_response)
                             response2_type = response_dict2['type']
 
                             if(response2_type == "event"):
@@ -575,6 +597,21 @@ def fetch_court_ids():
             # Core restart, before the entity exists again) -- it no longer
             # needs the GET to succeed just to know the display name.
             LIGHT_FRIENDLY_NAME_MAP[stable_entity_id] = light[3]
+
+            # Also seed last_light_states with what OK Cloud already knows,
+            # so ha_core_recovery_watcher() has something to replay even if
+            # this is a fresh add-on start and no light command has come in
+            # yet over MQTT. Mirrors the on/off/min/max logic in the
+            # "create lights in HA" loop right below.
+            _state = light[4]
+            if normalize_ha_light_state(_state) == "off":
+                _brightness = 0
+            elif str(_state).strip().lower() == "on":
+                _brightness = light[6]
+            else:
+                _brightness = light[5]
+            with last_light_states_lock:
+                last_light_states[stable_entity_id] = (_state, light[1], _brightness)
 
         # create lights in HA
         for index, light in enumerate(lights, start=1):
@@ -831,7 +868,15 @@ def listen_mqtt_light_topics(court_ids):
                     # No explicit brightness in this payload shape: treat
                     # on=100 / off=0, same convention as fetch_data_with_light_id's
                     # own default. Kept explicit here for clarity.
-                    brightness_value = 100 if parsed_payload == 'on' else 0
+                    # Fixed 2026-09-11: was `100 if parsed_payload == 'on' else 0`,
+                    # a literal string comparison that only matched the exact
+                    # value 'on'. Taykus can also send "true"/"false" here,
+                    # which normalize_ha_light_state() correctly treats as
+                    # on/off but this literal check didn't -- "true" was
+                    # falling through to brightness=0 while state ended up
+                    # "on" elsewhere, an inconsistent on-with-zero-brightness
+                    # payload. Use the same central normalizer everywhere.
+                    brightness_value = 100 if normalize_ha_light_state(parsed_payload) == 'on' else 0
                 else:
                     state_value = parsed_payload['state']
                     brightness_value = parsed_payload['brightness_pct']
@@ -890,6 +935,12 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
         # being silently lost. See pending_light_writes above.
         with pending_light_writes_lock:
             pending_light_writes[data_from_mqtt] = (state, court_id, brightness_pct)
+        # Also remember it as the last known-good desired state regardless
+        # of pending/retry status, so a plain Core restart (no new command
+        # arriving at all) can still be recovered from via
+        # ha_core_recovery_watcher() -- see that function below.
+        with last_light_states_lock:
+            last_light_states[data_from_mqtt] = (state, court_id, brightness_pct)
 
         # Fixed 2026-09-11: this GET used to GATE the POST -- if it didn't
         # return 200 (e.g. the entity doesn't exist yet, which is exactly
@@ -969,6 +1020,47 @@ def retry_pending_light_writes():
             logging.info(f"Retrying {len(snapshot)} pending light write(s)...")
         for state, court_id, brightness_pct in snapshot:
             fetch_data_with_light_id(state, court_id, brightness_pct)
+
+
+def ha_core_recovery_watcher():
+    """
+    Background worker: every HA_CORE_AVAILABILITY_CHECK_INTERVAL_SECONDS,
+    checks whether Home Assistant Core is reachable via the Supervisor
+    proxy. On the transition unavailable -> available (i.e. Core just came
+    back after being down, most commonly a Core restart), replays every
+    light's last known desired state through pending_light_writes so
+    retry_pending_light_writes() recreates every binary_sensor.pista_N --
+    covers a plain restart during which no new light command happened to
+    arrive at all. Added 2026-09-11, second pass.
+    """
+    global ha_core_available
+    while True:
+        time.sleep(HA_CORE_AVAILABILITY_CHECK_INTERVAL_SECONDS)
+        try:
+            response = requests.get(
+                home_assistant_url + "/api/",
+                headers={"Authorization": f"Bearer {home_assistant_access_key}"},
+                timeout=HA_REQUEST_TIMEOUT,
+            )
+            available_now = response.status_code == 200
+        except Exception:
+            available_now = False
+
+        was_available = ha_core_available
+        ha_core_available = available_now
+
+        # Only replay on an observed False -> True transition. Never on
+        # the very first check (was_available is None then) -- that's
+        # just establishing the baseline, not a recovery.
+        if was_available is False and available_now is True:
+            with last_light_states_lock:
+                snapshot = dict(last_light_states)
+            logging.info(
+                f"Home Assistant Core is back -- replaying {len(snapshot)} "
+                f"known light state(s)."
+            )
+            with pending_light_writes_lock:
+                pending_light_writes.update(snapshot)
 
 #---------------------------------------------------------------------------------------------------------
 
@@ -1249,7 +1341,7 @@ def fetch_door_ids():
 
         # Build stable mapping for HA door entities while keeping MQTT/backend IDs unchanged.
         # Examples: backend/MQTT 33 -> binary_sensor.puerta_1, 48 -> binary_sensor.puerta_2
-        global DOOR_ENTITY_MAP, DOOR_ENTITY_REVERSE_MAP
+        global DOOR_ENTITY_MAP, DOOR_ENTITY_REVERSE_MAP, DOOR_FRIENDLY_NAME_MAP
         DOOR_ENTITY_MAP = {}
         DOOR_ENTITY_REVERSE_MAP = {}
         for index, door in enumerate(doors, start=1):
@@ -1257,6 +1349,9 @@ def fetch_door_ids():
             DOOR_ENTITY_MAP[str(door[1])] = stable_entity_id
             DOOR_ENTITY_MAP[str(door[0])] = stable_entity_id
             DOOR_ENTITY_REVERSE_MAP[stable_entity_id] = str(door[1])
+            # Added 2026-09-11: same reasoning as LIGHT_FRIENDLY_NAME_MAP --
+            # a fallback name source for when the entity doesn't exist yet.
+            DOOR_FRIENDLY_NAME_MAP[stable_entity_id] = door[3]
         
 
         # create doors in HA
@@ -1471,30 +1566,46 @@ def fetch_data_with_door_id(state,door_id):
 
         api_url_sensor = api_url.format(data_from_mqtt)
 
-        respose_get_entity = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
-        if respose_get_entity.status_code == 200:
-            logging.info(respose_get_entity.json())
-            sensor_data = {
-                "entity_id": data_from_mqtt,
-                "state": "off" if state == 'close' else "on",
-                "attributes": {
-                    "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
-                    "device_class": "door",                
-                },
-            }
-            
-            
-            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
-
-            if response4.status_code == 200:
-                logging.info(f"Binary sensor {data_from_mqtt} updated successfully!") 
-                
-            elif response4.status_code == 201:
-                logging.info(f"Binary sensor {data_from_mqtt} created successfully!") 
-                
+        # Fixed 2026-09-11: same bug as fetch_data_with_light_id had --
+        # the POST used to only run inside `if GET == 200`, so a door
+        # entity missing after a HA Core restart could never be
+        # recreated. GET is now optional (only used to refresh
+        # friendly_name), POST always runs.
+        friendly_name = DOOR_FRIENDLY_NAME_MAP.get(data_from_mqtt, data_from_mqtt)
+        try:
+            respose_get_entity = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
+            if respose_get_entity.status_code == 200:
+                fetched_name = respose_get_entity.json().get('attributes', {}).get('friendly_name')
+                if fetched_name:
+                    friendly_name = fetched_name
             else:
-                logging.info(f"Error creating binary sensor {data_from_mqtt}: {response4.status_code} - {response4.text}")
-            
+                logging.info(
+                    f"GET for {data_from_mqtt} returned {respose_get_entity.status_code} "
+                    f"(entity may not exist yet) -- proceeding to POST anyway."
+                )
+        except Exception as get_exc:
+            logging.info(f"GET for {data_from_mqtt} failed ({get_exc}) -- proceeding to POST anyway.")
+
+        sensor_data = {
+            "entity_id": data_from_mqtt,
+            "state": "off" if state == 'close' else "on",
+            "attributes": {
+                "friendly_name": friendly_name,
+                "device_class": "door",
+            },
+        }
+
+        response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
+
+        if response4.status_code == 200:
+            logging.info(f"Binary sensor {data_from_mqtt} updated successfully!")
+
+        elif response4.status_code == 201:
+            logging.info(f"Binary sensor {data_from_mqtt} created successfully!")
+
+        else:
+            logging.info(f"Error creating binary sensor {data_from_mqtt}: {response4.status_code} - {response4.text}")
+
     except Exception as e:
           logging.info(f"An error occurr while updating door states: {e}")
 
@@ -2695,6 +2806,9 @@ if __name__ == '__main__':
                                             # start it only once config is actually loaded.
                                             retry_thread = threading.Thread(target=retry_pending_light_writes, daemon=True)
                                             retry_thread.start()
+
+                                            core_recovery_thread = threading.Thread(target=ha_core_recovery_watcher, daemon=True)
+                                            core_recovery_thread.start()
 
                                             t1.start()
                                             t2.start()
