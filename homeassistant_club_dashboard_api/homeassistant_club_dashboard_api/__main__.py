@@ -79,6 +79,7 @@ facility_id = 0
 # stable entities for automations and dashboards: binary_sensor.pista_1, binary_sensor.pista_2...
 # and binary_sensor.puerta_1, binary_sensor.puerta_2...
 LIGHT_ENTITY_MAP = {}          # backend/MQTT light id -> HA entity suffix (pista_N)
+LIGHT_FRIENDLY_NAME_MAP = {}   # HA entity suffix (pista_N) -> friendly_name known from OK Cloud
 LIGHT_ENTITY_REVERSE_MAP = {}  # HA entity suffix (pista_N) -> backend light id
 DOOR_ENTITY_MAP = {}           # backend/MQTT door id -> HA entity suffix (puerta_N)
 DOOR_ENTITY_REVERSE_MAP = {}   # HA entity suffix (puerta_N) -> backend door id
@@ -370,8 +371,8 @@ async def handle_websocket(websocket, path):
         message = await websocket.recv()
         logging.info(f"Received message: {message}")
 
-        access_token = sys.argv[2]
-        url = "ws://homeassistant.local:8123/api/websocket"
+        access_token = home_assistant_access_key  # was sys.argv[2] -- fixed 2026-09-11
+        url = "ws://supervisor/core/websocket"  # was homeassistant.local -- fixed 2026-09-11
 
         async with websockets.connect(url) as websocket_ha:
 
@@ -558,7 +559,7 @@ def fetch_court_ids():
 
         # Build stable mapping for HA entities while keeping MQTT/backend IDs unchanged.
         # Examples: backend/MQTT 66 -> binary_sensor.pista_1, 67 -> binary_sensor.pista_2
-        global LIGHT_ENTITY_MAP, LIGHT_ENTITY_REVERSE_MAP
+        global LIGHT_ENTITY_MAP, LIGHT_ENTITY_REVERSE_MAP, LIGHT_FRIENDLY_NAME_MAP
         LIGHT_ENTITY_MAP = {}
         LIGHT_ENTITY_REVERSE_MAP = {}
         for index, light in enumerate(lights, start=1):
@@ -568,6 +569,12 @@ def fetch_court_ids():
             LIGHT_ENTITY_MAP[str(light[0])] = stable_entity_id
             # For writes back to OK Cloud, use the backend DB id.
             LIGHT_ENTITY_REVERSE_MAP[stable_entity_id] = str(light[0])
+            # Added 2026-09-11: keep the friendly_name we already know from
+            # OK Cloud so fetch_data_with_light_id() can create/update the
+            # HA entity even when a prior GET fails (e.g. right after a HA
+            # Core restart, before the entity exists again) -- it no longer
+            # needs the GET to succeed just to know the display name.
+            LIGHT_FRIENDLY_NAME_MAP[stable_entity_id] = light[3]
 
         # create lights in HA
         for index, light in enumerate(lights, start=1):
@@ -871,7 +878,6 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
         # No brightness info at all: default on=100 / off=0 (per Alvaro,
         # 2026-09-11 -- this is the original, intentional behavior for
         # binary_sensor lights with no real dimming capability).
-        has_explicit_brightness = True
         if brightness_pct is None:
             brightness_pct = 100 if normalize_ha_light_state(state) == "on" else 0
 
@@ -885,52 +891,61 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
         with pending_light_writes_lock:
             pending_light_writes[data_from_mqtt] = (state, court_id, brightness_pct)
 
-        respose_get_entity = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
-
-        if respose_get_entity.status_code == 200:
-            logging.info(respose_get_entity.json())
-
-            attributes = {
-                "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
-                "device_class": "light",
-                "meta_state": state
-            }
-            if has_explicit_brightness:
-                attributes["brightness"] = normalize_ha_light_brightness(state, brightness_pct)
-
-            sensor_data = {
-                "entity_id": data_from_mqtt,
-                "state": normalize_ha_light_state(state, brightness_pct),
-                "attributes": attributes,
-            }
-            
-            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
-
-            if response4.status_code == 200:
-                logging.info(f"Light entity {data_from_mqtt} updated successfully!")    
-            elif response4.status_code == 201:
-                logging.info(f"Light entity {data_from_mqtt} created successfully!") 
+        # Fixed 2026-09-11: this GET used to GATE the POST -- if it didn't
+        # return 200 (e.g. the entity doesn't exist yet, which is exactly
+        # what happens right after a Home Assistant Core restart), the POST
+        # was skipped entirely and the retry worker just kept re-running
+        # this same failing GET forever, never actually recovering. Now the
+        # GET is only used to fetch a friendly_name if the entity already
+        # exists; if it doesn't (or the request fails), we fall back to the
+        # name already known from OK Cloud (LIGHT_FRIENDLY_NAME_MAP) and
+        # attempt the POST regardless -- POST also creates the entity
+        # (HA returns 201) if it's missing.
+        friendly_name = LIGHT_FRIENDLY_NAME_MAP.get(data_from_mqtt, data_from_mqtt)
+        try:
+            respose_get_entity = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
+            if respose_get_entity.status_code == 200:
+                fetched_name = respose_get_entity.json().get('attributes', {}).get('friendly_name')
+                if fetched_name:
+                    friendly_name = fetched_name
             else:
-                logging.info(f"Error creating light entity {data_from_mqtt}: {response4.status_code} - {response4.text}")
-                return
+                logging.info(
+                    f"GET for {data_from_mqtt} returned {respose_get_entity.status_code} "
+                    f"(entity may not exist yet) -- proceeding to POST anyway, using "
+                    f"friendly_name from OK Cloud."
+                )
+        except Exception as get_exc:
+            logging.info(f"GET for {data_from_mqtt} failed ({get_exc}) -- proceeding to POST anyway.")
 
-            # Only reached on a successful write (200/201 above) -- clear
-            # the pending marker. If we returned early on a non-2xx status,
-            # it stays pending and the retry worker will pick it up.
-            with pending_light_writes_lock:
-                # Only clear it if nothing newer has been queued for this
-                # entity since we started this attempt.
-                if pending_light_writes.get(data_from_mqtt) == (state, court_id, brightness_pct):
-                    pending_light_writes.pop(data_from_mqtt, None)
+        attributes = {
+            "friendly_name": friendly_name,
+            "device_class": "light",
+            "meta_state": state,
+            "brightness": normalize_ha_light_brightness(state, brightness_pct),
+        }
+
+        sensor_data = {
+            "entity_id": data_from_mqtt,
+            "state": normalize_ha_light_state(state, brightness_pct),
+            "attributes": attributes,
+        }
+
+        response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
+
+        if response4.status_code == 200:
+            logging.info(f"Light entity {data_from_mqtt} updated successfully!")
+        elif response4.status_code == 201:
+            logging.info(f"Light entity {data_from_mqtt} created successfully!")
         else:
-            logging.info(
-                f"Could not fetch current state for {data_from_mqtt} "
-                f"(status {respose_get_entity.status_code}) -- leaving desired "
-                f"state pending, will retry."
-            )
-            return
+            logging.info(f"Error creating light entity {data_from_mqtt}: {response4.status_code} - {response4.text}")
+            return  # left pending, retry worker will pick it up
 
-        # publish_light_state(court_id, state, brightness_pct)
+        # Only reached on a successful write (200/201 above) -- clear
+        # the pending marker, but only if nothing newer has been queued
+        # for this entity since we started this attempt.
+        with pending_light_writes_lock:
+            if pending_light_writes.get(data_from_mqtt) == (state, court_id, brightness_pct):
+                pending_light_writes.pop(data_from_mqtt, None)
 
         logging.info(f"Updated light state for court_id: {court_id}, state: {state}, brightness_pct: {brightness_pct}")
 
@@ -1779,8 +1794,8 @@ def getEntityState():
 
       try:
             api_url = home_assistant_url + "/api/states/{}"
-            access_token = sys.argv[2]
-            logging.info(access_token)
+            access_token = home_assistant_access_key  # was sys.argv[2] -- fixed 2026-09-11
+            # Removed 2026-09-11: was logging the HA access token in plaintext
 
             headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -1806,7 +1821,7 @@ def getDoorState():
 
       try:
             api_url = home_assistant_url + "/api/states/binary_sensor.{}"
-            access_token = sys.argv[2]
+            access_token = home_assistant_access_key  # was sys.argv[2] -- fixed 2026-09-11
 
             headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -1836,7 +1851,7 @@ def getDoorStateByEntityId(entity_id):
 
       try:
             api_url = home_assistant_url + "/api/states/binary_sensor.{}"
-            access_token = sys.argv[2]
+            access_token = home_assistant_access_key  # was sys.argv[2] -- fixed 2026-09-11
 
             headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -2201,7 +2216,7 @@ def deleteDoorFromHa(entity_id):
     
    
     # Replace with your Home Assistant access token
-    access_token = sys.argv[2]
+    access_token = home_assistant_access_key  # was sys.argv[2] -- fixed 2026-09-11
 
     # Headers for the request
     headers = {
@@ -2418,37 +2433,14 @@ def deleteDoorFromHa(entity_id):
 #       except Exception as e:
 #           logging.info(f"An error occurre while getting api key: {e}")
  
-def clear_all_entities():
-    logging.info("home_assistant_access_key in clearing function: {}".format(home_assistant_access_key))
-    try:
-      # Replace with your Home Assistant access token
-      access_token = home_assistant_access_key
-
-      # Headers for the request
-      headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-      }
-      response6 = requests.get(home_assistant_url+'/api/states', headers=headers, timeout=HA_REQUEST_TIMEOUT)      
-      data = response6.json()
-      filtered_list = [item for item in data if 'binary_sensor' in item['entity_id']]
-      
-      for item in filtered_list:
-        filtered_list_entity_id = item['entity_id']
-        logging.info(filtered_list_entity_id)
-
-        response7=requests.delete(home_assistant_url+'/api/states/'+filtered_list_entity_id, headers=headers, timeout=HA_REQUEST_TIMEOUT)
-        logging.info(response7.json())
-
-        # delete lights from local DB
-        light_entity_id_fro_delete = filtered_list_entity_id.replace("binary_sensor.", "")
-        logging.info(light_entity_id_fro_delete)
-
-        # db.deleteLight()
-        logging.info(light_entity_id_fro_delete+' light deleted from local DB')
-
-    except Exception as e:
-        logging.info(f"An error occurred: {e}")
+# Removed entirely 2026-09-11 (was already unused, not called anywhere
+# since the earlier fix removed the startup call): clear_all_entities()
+# deleted every binary_sensor.* entity in the whole Home Assistant
+# instance, including ones unrelated to LoboBrain. Too dangerous to leave
+# lying around for someone to call again later. If a legitimate need for
+# LoboBrain-owned-entity cleanup comes up, it should target only entities
+# LoboBrain actually created (LIGHT_ENTITY_MAP / DOOR_ENTITY_MAP), never
+# a blanket 'binary_sensor' filter.
 
 # def mqtt_process():
 #     logging.info('mqtt_process function starts')
@@ -2675,13 +2667,13 @@ if __name__ == '__main__':
 
 
                                             createTables()
-                                            # Removed 2026-09-11: clear_all_entities() deleted EVERY
-                                            # binary_sensor.* entity in the whole Home Assistant instance
-                                            # on every add-on restart -- including entities that have
-                                            # nothing to do with LoboBrain (solar-permission helpers,
-                                            # manual-mode helpers, unrelated Shelly sensors, etc).
-                                            # Confirmed in production logs, 2026-09-11.
-                                            # clear_all_entities()
+                                            # Removed 2026-09-11: this used to call clear_all_entities(),
+                                            # which deleted EVERY binary_sensor.* entity in the whole
+                                            # Home Assistant instance on every add-on restart --
+                                            # including entities unrelated to LoboBrain (solar-permission
+                                            # helpers, manual-mode helpers, unrelated Shelly sensors, etc).
+                                            # Confirmed in production logs, 2026-09-11. The function
+                                            # itself has since been deleted entirely from this file.
                                             # create_doors_in_ha_from_db()
                                             # t1 = threading.Thread(target=slytekIntergration, name='t1',daemon = True)
                                             # t2 = threading.Thread(target=mqtt_process_thread, name='t2',daemon = True)
