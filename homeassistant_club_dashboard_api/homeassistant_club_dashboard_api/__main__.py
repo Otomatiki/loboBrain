@@ -29,6 +29,11 @@ app = Flask(__name__)
 CORS(app)
 # sio = socketio.Client()
 logging.basicConfig(level=logging.DEBUG)
+# 2026-09-12: keep our own DEBUG/INFO logging as-is, but silence urllib3's
+# per-connection DEBUG noise (two extra lines per HTTP request) -- with the
+# recovery watchdog polling every 15s this was flooding the log and making
+# it hard to read, purely a legibility issue, not a functional one.
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app, cors_allowed_origins='*')
